@@ -497,6 +497,12 @@ class MessageOrchestrator:
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("model", "Switch Claude model and effort"),
                 BotCommand("restart", "Restart the bot"),
+                # Vault commands (forwarded to Claude via _handle_unknown_command)
+                BotCommand("today", "Morning briefing and daily plan"),
+                BotCommand("closeday", "End of day review and reflection"),
+                BotCommand("capture", "Quick capture a thought"),
+                BotCommand("schedule", "Plan your week"),
+                BotCommand("context", "Load context for a topic"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
