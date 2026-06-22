@@ -1,0 +1,12 @@
+# Реестр проектов для Project Threads (group-режим).
+# path — относительно APPROVED_DIRECTORY (D:/Projects).
+projects:
+  - slug: huskarl
+    name: HuskarlBot
+    path: HuskarlBot
+    enabled: true
+
+  - slug: claude-code-telegram
+    name: Claude Code Telegram
+    path: claude-code-telegram
+    enabled: true
