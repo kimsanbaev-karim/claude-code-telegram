@@ -447,6 +447,9 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
     # Also has a stop: handler
     stop_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("stop:1")]
     assert len(stop_handler) == 1
+    # And an ask: handler for AskUserQuestion inline answers
+    ask_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("ask:q:0")]
+    assert len(ask_handler) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):

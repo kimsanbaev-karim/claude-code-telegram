@@ -246,10 +246,15 @@ class MessageOrchestrator:
 
         project = await manager.resolve_project(chat.id, message_thread_id)
         if not project:
-            await self._reject_for_thread_mode(
-                update,
-                manager.guidance_message(mode=self.settings.project_threads_mode),
-            )
+            # Fallback 1: karim.kanban task-topic → route to the task's working_dir
+            # (writing in a task topic = commanding that task's agent, two-way).
+            if self._apply_task_thread_context(chat.id, message_thread_id, context):
+                return True
+            # Fallback 2: forum General topic → base working dir for general commands
+            # (not tied to a project/task; agent may propose kanban tasks per CLAUDE.md).
+            if self._apply_general_context(chat.id, message_thread_id, context):
+                return True
+            await self._reject_for_thread_mode(update, manager.guidance_message(mode=self.settings.project_threads_mode))
             return False
 
         state_key = f"{chat.id}:{message_thread_id}"
@@ -273,6 +278,82 @@ class MessageOrchestrator:
             "project_slug": project.slug,
             "project_root": str(project_root),
             "project_name": project.name,
+        }
+        return True
+
+    def _apply_task_thread_context(self, chat_id: int, message_thread_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Route a karim.kanban task-topic to the task's working_dir (two-way).
+
+        Reads data/task_threads.json (written by karim.kanban's topic.py). When the
+        thread maps to a task, points thread-local state at the task's working_dir so
+        a message in the task topic runs Claude in that folder.
+        """
+        import json
+
+        log = structlog.get_logger()
+        try:
+            raw = Path("data/task_threads.json").read_text(encoding="utf-8")
+            mapping = json.loads(raw) if raw.strip() else {}
+        except (OSError, ValueError):
+            return False
+        info = mapping.get(str(message_thread_id))
+        working_raw = info.get("working_dir") if info else None
+        if not working_raw:
+            return False
+        working = Path(working_raw).resolve()
+        if not working.is_dir():
+            log.warning("task-topic working_dir missing", working_dir=str(working), task_id=(info or {}).get("task_id"))
+            return False
+        task_id = info.get("task_id", "?")
+        state_key = f"{chat_id}:{message_thread_id}"
+        thread_states = context.user_data.setdefault("thread_state", {})
+        state = thread_states.get(state_key, {})
+        current_dir_raw = state.get("current_directory")
+        current_dir = Path(current_dir_raw).resolve() if current_dir_raw else working
+        if not self._is_within(current_dir, working) or not current_dir.is_dir():
+            current_dir = working
+        context.user_data["current_directory"] = current_dir
+        context.user_data["claude_session_id"] = state.get("claude_session_id")
+        context.user_data["_thread_context"] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "state_key": state_key,
+            "project_slug": f"task:{task_id}",
+            "project_root": str(working),
+            "project_name": f"kanban:{task_id}",
+            "task_id": task_id,
+        }
+        log.info("Routed task-topic", task_id=task_id, message_thread_id=message_thread_id, working_dir=str(working))
+        return True
+
+    def _apply_general_context(self, chat_id: int, message_thread_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Allow the forum General topic (thread 1) as a base-dir working context.
+
+        General is for broad commands not tied to a project/task. Routes to
+        APPROVED_DIRECTORY so the agent works at the projects root and can, per the
+        global CLAUDE.md rules, propose creating kanban tasks when appropriate.
+        """
+        if message_thread_id != 1:
+            return False
+        base = Path(self.settings.approved_directory).resolve()
+        if not base.is_dir():
+            return False
+        state_key = f"{chat_id}:{message_thread_id}"
+        thread_states = context.user_data.setdefault("thread_state", {})
+        state = thread_states.get(state_key, {})
+        current_dir_raw = state.get("current_directory")
+        current_dir = Path(current_dir_raw).resolve() if current_dir_raw else base
+        if not self._is_within(current_dir, base) or not current_dir.is_dir():
+            current_dir = base
+        context.user_data["current_directory"] = current_dir
+        context.user_data["claude_session_id"] = state.get("claude_session_id")
+        context.user_data["_thread_context"] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "state_key": state_key,
+            "project_slug": "general",
+            "project_root": str(base),
+            "project_name": "General",
         }
         return True
 
@@ -350,7 +431,7 @@ class MessageOrchestrator:
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command
+        from .handlers import callback, command
 
         # Commands
         handlers = [
@@ -434,12 +515,13 @@ class MessageOrchestrator:
         )
 
         # Only cd: callbacks (for project selection), scoped by pattern
-        app.add_handler(
-            CallbackQueryHandler(
-                self._inject_deps(self._agentic_callback),
-                pattern=r"^cd:",
-            )
-        )
+        app.add_handler(CallbackQueryHandler(self._inject_deps(self._agentic_callback), pattern=r"^cd:"))
+
+        # AskUserQuestion answers (ask:<qid>:<idx>) -> resolve pending question.
+        # handle_callback_query acks the query and routes ask: to handle_ask_callback.
+        # Required because agentic mode does NOT register the classic general
+        # CallbackQueryHandler, so ask: would otherwise match no handler.
+        app.add_handler(CallbackQueryHandler(self._inject_deps(callback.handle_callback_query), pattern=r"^ask:"))
 
         logger.info("Agentic handlers registered")
 
@@ -799,9 +881,15 @@ class MessageOrchestrator:
         """
 
         async def _heartbeat() -> None:
+            from .ask_user import has_any_pending
             try:
                 while True:
                     await asyncio.sleep(interval)
+                    # Пока висит вопрос (AskUserQuestion) — НЕ показываем "печатает":
+                    # вопрос с кнопками сам сигнал пользователю, иначе долгое ожидание
+                    # ответа выглядит как зависание бота.
+                    if has_any_pending(chat.id):
+                        continue
                     try:
                         await chat.send_action("typing")
                     except Exception:
@@ -1169,6 +1257,12 @@ class MessageOrchestrator:
         # original dashed form before forwarding to Claude's skill dispatcher.
         message_text = self.rewrite_skill_command(message_text)
 
+        # Если в этом чате/топике висит AskUserQuestion — этот текст = кастомный ответ на него
+        from .ask_user import resolve_text
+
+        if message_text and resolve_text(update.message.chat.id, update.message.message_thread_id, message_text):
+            return
+
         logger.info(
             "Agentic text message",
             user_id=user_id,
@@ -1289,6 +1383,19 @@ class MessageOrchestrator:
         # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
 
+        # Restart-resilient resume: if no in-memory session (e.g. a process restart
+        # wiped thread_state before PicklePersistence flushed it), recover the most
+        # recent session for THIS directory from the persistent SQLite store — the
+        # same source cd/repo use. Skipped when /new forced a fresh session.
+        if session_id is None and not force_new:
+            try:
+                _resumable = await claude_integration._find_resumable_session(user_id, current_dir)
+                if _resumable:
+                    session_id = _resumable.session_id
+                    logger.info("Recovered session from persistent store", user_id=user_id, session_id=session_id)
+            except Exception as _e:
+                logger.debug("resumable-session fallback failed", error=str(_e))
+
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
@@ -1324,6 +1431,11 @@ class MessageOrchestrator:
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
+        # Human-in-the-loop: AskUserQuestion → inline-кнопки в этот чат/топик
+        from .ask_user import build_ask_user
+
+        ask_user_fn = build_ask_user(context.bot, chat.id, update.message.message_thread_id)
+
         success = True
         try:
             claude_response = await claude_integration.run_command(
@@ -1336,6 +1448,7 @@ class MessageOrchestrator:
                 interrupt_event=interrupt_event,
                 model_override=context.user_data.get("model_override"),
                 effort_override=context.user_data.get("effort_override"),
+                ask_user=ask_user_fn,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1846,9 +1959,15 @@ class MessageOrchestrator:
 
         try:
             voice = update.message.voice
-            processed_voice = await voice_handler.process_voice_message(
-                voice, update.message.caption
-            )
+            processed_voice = await voice_handler.process_voice_message(voice, update.message.caption)
+
+            # Голосовой ответ на висящий AskUserQuestion: расшифровка → resolve_text
+            # (как в текстовом пути agentic_text). Вопрос закрыт — новый прогон не запускаем.
+            from .ask_user import resolve_text
+            _voice_text = (processed_voice.prompt or "").strip()
+            if _voice_text and resolve_text(update.message.chat.id, update.message.message_thread_id, _voice_text):
+                await progress_msg.edit_text("✅ Голосовой ответ принят.")
+                return
 
             await progress_msg.edit_text("Working...")
             await self._handle_agentic_media_message(
