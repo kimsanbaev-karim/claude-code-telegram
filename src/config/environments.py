@@ -10,7 +10,7 @@ class DevelopmentConfig:
     development_mode: bool = True
     log_level: str = "DEBUG"
     rate_limit_requests: int = 100  # More lenient for testing
-    claude_timeout_seconds: int = 600  # Longer timeout for debugging
+    claude_timeout_seconds: int = 1200  # 20 мин бюджет АКТИВНОЙ работы Claude (человеко-ожидание AskUserQuestion исключается watchdog'ом, см. sdk_integration)
     enable_telemetry: bool = False
 
     @classmethod

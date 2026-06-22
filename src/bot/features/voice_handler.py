@@ -199,7 +199,8 @@ class VoiceHandler:
         if not api_key:
             raise RuntimeError("OpenAI API key is not configured.")
 
-        self._openai_client = AsyncOpenAI(api_key=api_key)
+        # PATCH (Karim): custom base_url lets a Groq key drive Whisper without an OpenAI key.
+        self._openai_client = AsyncOpenAI(api_key=api_key, base_url=self.config.openai_base_url or None)
         return self._openai_client
 
     # -- Local whisper.cpp provider --

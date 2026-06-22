@@ -210,9 +210,8 @@ class Settings(BaseSettings):
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
     )
-    openai_api_key: Optional[SecretStr] = Field(
-        None, description="OpenAI API key for Whisper voice transcription"
-    )
+    openai_api_key: Optional[SecretStr] = Field(None, description="OpenAI API key for Whisper voice transcription")
+    openai_base_url: Optional[str] = Field(None, description="OpenAI-compatible transcription base URL (e.g. Groq endpoint).")
     voice_transcription_model: Optional[str] = Field(
         None,
         description=(
