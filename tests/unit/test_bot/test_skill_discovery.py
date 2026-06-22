@@ -33,7 +33,10 @@ def fake_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    # Path.home() on POSIX honors $HOME; monkeypatching HOME is enough.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    # Path.home() honors $HOME on POSIX but USERPROFILE on Windows; patch
+    # Path.home directly so the override is cross-platform.
+    monkeypatch.setattr(Path, "home", lambda: home)
     return home
 
 
