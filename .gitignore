@@ -146,6 +146,7 @@ data/
 sessions/
 backups/
 uploads/
+.uploads/
 config/mcp.json
 # Local env backups (ignored)
 .env.bak
