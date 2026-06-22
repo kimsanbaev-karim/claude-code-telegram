@@ -1169,18 +1169,17 @@ class TestClaudeMdLoading:
         assert "# Project Rules" not in opts.system_prompt
 
     async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
-        """setting_sources=['project'] is passed to ClaudeAgentOptions."""
-        captured: list = []
-        mock_factory = _mock_client_factory(
-            _make_assistant_message("ok"),
-            _make_result_message(),
-            capture_options=captured,
-        )
+        """setting_sources passes user/project/local to ClaudeAgentOptions.
 
-        with patch(
-            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
-        ):
+        Patched (Karim evo): expanded from ['project'] to ['user','project','local']
+        so filesystem Skills (~/.claude/skills) and user/project/local CLAUDE.md load.
+        """
+        captured: list = []
+        mock_factory = _mock_client_factory(_make_assistant_message("ok"), _make_result_message(), capture_options=captured)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory):
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert opts.setting_sources == ["project"]
+        assert opts.setting_sources == ["user", "project", "local"]
+        assert "project" in opts.setting_sources

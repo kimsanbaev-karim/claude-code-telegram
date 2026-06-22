@@ -182,6 +182,8 @@ def _make_can_use_tool_callback(
     security_validator: SecurityValidator,
     working_directory: Path,
     approved_directory: Path,
+    ask_user: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    human_wait_holder: Optional[Dict[str, float]] = None,
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
@@ -191,11 +193,30 @@ def _make_can_use_tool_callback(
     _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
     _BASH_TOOLS = {"Bash", "bash", "shell"}
 
-    async def can_use_tool(
-        tool_name: str,
-        tool_input: Dict[str, Any],
-        context: ToolPermissionContext,
-    ) -> Any:
+    async def can_use_tool(tool_name: str, tool_input: Dict[str, Any], context: ToolPermissionContext) -> Any:
+        # AskUserQuestion → render as Telegram inline buttons (human-in-the-loop).
+        # Deny carries the user's answer back as the tool result (the headless tool
+        # returns nothing useful), so the agent reads the answer and continues.
+        if tool_name == "AskUserQuestion" and ask_user is not None:
+            _t0 = asyncio.get_event_loop().time()
+            # Mark the wait as ONGOING so the timeout watchdog excludes it in real time
+            # (not just after the answer arrives) — a long human answer must never time out.
+            if human_wait_holder is not None:
+                human_wait_holder["waiting_since"] = _t0
+            try:
+                answers = await ask_user(tool_input)
+            except Exception as e:
+                logger.warning("ask_user failed", error=str(e))
+                return PermissionResultAllow()
+            finally:
+                if human_wait_holder is not None:
+                    human_wait_holder["extra"] += asyncio.get_event_loop().time() - _t0
+                    human_wait_holder["waiting_since"] = 0.0
+            if answers:
+                msg = "Ответ пользователя на AskUserQuestion (учти и продолжай, НЕ вызывай тул снова): " + answers
+                return PermissionResultDeny(message=msg)
+            return PermissionResultAllow()
+
         # File path validation
         if tool_name in _FILE_TOOLS:
             file_path = tool_input.get("file_path") or tool_input.get("path")
@@ -286,6 +307,7 @@ class ClaudeSDKManager:
         images: Optional[List[Dict[str, str]]] = None,
         model_override: Optional[str] = None,
         effort_override: Optional[str] = None,
+        ask_user: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -348,7 +370,14 @@ class ClaudeSDKManager:
                 },
                 system_prompt=base_prompt,
                 effort=effort_override,
-                setting_sources=["project"],
+                # PATCH (Karim evo): `skills` is THE switch for filesystem Skills.
+                # Per SDK types.py docs, putting "Skill" in allowed_tools is
+                # DEPRECATED and does NOT load ~/.claude/skills; setting `skills`
+                # makes the SDK enable discovery + the Skill tool itself.
+                # "all" = every discovered skill (karim.kanban, speckit-*, …).
+                # setting_sources kept explicit for CLAUDE.md + user/project/local.
+                skills="all",
+                setting_sources=["user", "project", "local"],
                 stderr=_stderr_callback,
             )
 
@@ -367,12 +396,19 @@ class ClaudeSDKManager:
                     mcp_config_path=str(self.config.mcp_config_path),
                 )
 
+            # Human-wait holder: seconds spent blocking on an AskUserQuestion answer.
+            # The timeout watchdog adds this back to the budget so human think-time is
+            # NOT charged against claude_timeout_seconds (which guards a hung Claude).
+            human_wait_holder: Dict[str, float] = {"extra": 0.0, "waiting_since": 0.0}
+
             # Wire can_use_tool callback for preventive tool validation
             if self.security_validator:
                 options.can_use_tool = _make_can_use_tool_callback(
                     security_validator=self.security_validator,
                     working_directory=working_directory,
                     approved_directory=self.config.approved_directory,
+                    ask_user=ask_user,
+                    human_wait_holder=human_wait_holder,
                 )
 
             # Resume previous session if we have a session_id
@@ -491,43 +527,61 @@ class ClaudeSDKManager:
 
                     interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
 
-                # Note: asyncio.TimeoutError is intentionally NOT retried —
-                # it reflects a user-configured hard limit.
+                # Timeout watchdog. The deadline EXCLUDES time spent waiting on a
+                # human answer (AskUserQuestion): claude_timeout_seconds guards a hung
+                # Claude, not human think-time. can_use_tool pushes human_wait_holder
+                # up while a question is pending, so the budget grows by exactly the
+                # human-wait duration. asyncio.TimeoutError is NOT retried (hard limit).
+                timed_out = False
+                _loop = asyncio.get_event_loop()
+
+                async def _cancel_on_timeout() -> None:
+                    nonlocal timed_out
+                    started = _loop.time()
+                    while True:
+                        now = _loop.time()
+                        # Exclude human-wait from the budget: completed waits (extra) AND the
+                        # currently-ongoing ask_user wait (waiting_since), in real time.
+                        _ws = human_wait_holder.get("waiting_since") or 0.0
+                        ongoing = (now - _ws) if _ws else 0.0
+                        budget = self.config.claude_timeout_seconds + human_wait_holder["extra"] + ongoing
+                        remaining = budget - (now - started)
+                        if remaining <= 0:
+                            timed_out = True
+                            run_task.cancel()
+                            return
+                        await asyncio.sleep(min(remaining, 5.0))
+
+                timeout_watcher = asyncio.create_task(_cancel_on_timeout())
+
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(run_task),
-                        timeout=self.config.claude_timeout_seconds,
-                    )
+                    await asyncio.shield(run_task)
                     break  # success — exit retry loop
                 except asyncio.CancelledError:
-                    if not interrupted:
-                        raise
-                    # Interrupt cancelled the task — wait for cleanup
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
-                    break  # user interrupted — don't retry
-                except asyncio.TimeoutError:
-                    run_task.cancel()
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
-                    raise  # timeout — don't retry
+                    if interrupted:
+                        # Interrupt cancelled the task — wait for cleanup
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
+                        break  # user interrupted — don't retry
+                    if timed_out:
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.TimeoutError()  # hard timeout — don't retry
+                    raise  # outer cancellation — propagate
                 except CLIConnectionError as exc:
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
                         last_exc = exc
-                        logger.warning(
-                            "Transient connection error, will retry",
-                            attempt=attempt + 1,
-                            error=str(exc),
-                        )
+                        logger.warning("Transient connection error, will retry", attempt=attempt + 1, error=str(exc))
                         continue
                     raise  # non-retryable or attempts exhausted
                 finally:
                     if interrupt_watcher is not None:
                         interrupt_watcher.cancel()
+                    timeout_watcher.cancel()
             else:
                 if last_exc is not None:
                     raise last_exc

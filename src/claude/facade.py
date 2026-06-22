@@ -42,6 +42,7 @@ class ClaudeIntegration:
         images: Optional[List[Dict[str, str]]] = None,
         model_override: Optional[str] = None,
         effort_override: Optional[str] = None,
+        ask_user: Optional[Callable] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -96,6 +97,7 @@ class ClaudeIntegration:
                     images=images,
                     model_override=model_override,
                     effort_override=effort_override,
+                    ask_user=ask_user,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -124,6 +126,7 @@ class ClaudeIntegration:
                         images=images,
                         model_override=model_override,
                         effort_override=effort_override,
+                        ask_user=ask_user,
                     )
                 else:
                     raise
@@ -171,6 +174,7 @@ class ClaudeIntegration:
         images: Optional[List[Dict[str, str]]] = None,
         model_override: Optional[str] = None,
         effort_override: Optional[str] = None,
+        ask_user: Optional[Callable] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -183,6 +187,7 @@ class ClaudeIntegration:
             images=images,
             model_override=model_override,
             effort_override=effort_override,
+            ask_user=ask_user,
         )
 
     async def _find_resumable_session(
