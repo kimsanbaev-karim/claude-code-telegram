@@ -601,8 +601,8 @@ class TestClaudeSandboxSettings:
         assert len(captured_options) == 1
         assert captured_options[0].allowed_tools == ["Read", "Write", "Bash"]
 
-    async def test_disable_tool_validation_sets_allowed_tools_none(self, tmp_path):
-        """allowed_tools=None when DISABLE_TOOL_VALIDATION=true."""
+    async def test_disable_tool_validation_sets_allowed_tools_empty(self, tmp_path):
+        """allowed_tools=[] when DISABLE_TOOL_VALIDATION=true (PR #206: avoid list(None) crash)."""
         config = Settings(
             telegram_bot_token="test:token",
             telegram_bot_username="testbot",
@@ -630,8 +630,8 @@ class TestClaudeSandboxSettings:
             )
 
         assert len(captured_options) == 1
-        assert captured_options[0].allowed_tools is None
-        assert captured_options[0].disallowed_tools is None
+        assert captured_options[0].allowed_tools == []
+        assert captured_options[0].disallowed_tools == []
 
     async def test_tool_validation_enabled_passes_configured_tools(self, tmp_path):
         """allowed/disallowed_tools passed when DISABLE_TOOL_VALIDATION=false."""
