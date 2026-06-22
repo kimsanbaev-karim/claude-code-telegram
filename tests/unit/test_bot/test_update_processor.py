@@ -7,7 +7,7 @@ Covers:
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from telegram import CallbackQuery, Update
 
@@ -19,8 +19,9 @@ from src.bot.update_processor import StopAwareUpdateProcessor
 
 
 def _make_update(callback_data: str | None = None) -> Update:
-    """Build a minimal Update mock with optional callback_query data."""
+    """Build a minimal Update mock for a callback update (message is None)."""
     update = MagicMock(spec=Update)
+    update.message = None
     if callback_data is not None:
         cb = MagicMock(spec=CallbackQuery)
         cb.data = callback_data
@@ -30,33 +31,62 @@ def _make_update(callback_data: str | None = None) -> Update:
     return update
 
 
+def _make_text_update(text: str, chat_id: int = 1, thread_id: int | None = None) -> Update:
+    """Build a minimal Update mock for a text message (no callback)."""
+    update = MagicMock(spec=Update)
+    update.callback_query = None
+    msg = MagicMock()
+    msg.text = text
+    msg.chat.id = chat_id
+    msg.message_thread_id = thread_id
+    update.message = msg
+    return update
+
+
 # ---------------------------------------------------------------------------
-# _is_priority_callback
+# _is_priority
 # ---------------------------------------------------------------------------
 
 
 class TestIsPriorityCallback:
     def test_stop_callback_detected(self):
         update = _make_update("stop:123")
-        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+        assert StopAwareUpdateProcessor._is_priority(update) is True
+
+    def test_ask_callback_detected(self):
+        update = _make_update("ask:abc123:0")
+        assert StopAwareUpdateProcessor._is_priority(update) is True
 
     def test_cd_callback_not_priority(self):
         update = _make_update("cd:my_project")
-        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority(update) is False
 
     def test_no_callback_query(self):
         update = _make_update(None)
-        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority(update) is False
 
     def test_non_update_object(self):
-        assert StopAwareUpdateProcessor._is_priority_callback("not an update") is False
+        assert StopAwareUpdateProcessor._is_priority("not an update") is False
 
     def test_callback_with_none_data(self):
         update = MagicMock(spec=Update)
+        update.message = None
         cb = MagicMock(spec=CallbackQuery)
         cb.data = None
         update.callback_query = cb
-        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority(update) is False
+
+    def test_text_with_pending_question_is_priority(self):
+        """A text answer to a pending AskUserQuestion bypasses the lock."""
+        update = _make_text_update("зелёный")
+        with patch("src.bot.ask_user.has_pending", return_value=True):
+            assert StopAwareUpdateProcessor._is_priority(update) is True
+
+    def test_text_without_pending_not_priority(self):
+        """A normal text message (no pending question) is not priority."""
+        update = _make_text_update("просто сообщение")
+        with patch("src.bot.ask_user.has_pending", return_value=False):
+            assert StopAwareUpdateProcessor._is_priority(update) is False
 
 
 # ---------------------------------------------------------------------------

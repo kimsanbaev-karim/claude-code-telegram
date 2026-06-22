@@ -30,7 +30,7 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     stops -> ``run_command()`` returns -> handler finishes -> lock released.
     """
 
-    _PRIORITY_PREFIXES = ("stop:",)
+    _PRIORITY_PREFIXES = ("stop:", "ask:")
 
     def __init__(self) -> None:
         # High limit so priority callbacks are never blocked by semaphore
@@ -38,16 +38,24 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         self._sequential_lock = asyncio.Lock()
 
     @classmethod
-    def _is_priority_callback(cls, update: object) -> bool:
-        """Return True if the update is a priority callback query."""
+    def _is_priority(cls, update: object) -> bool:
+        """Priority updates bypass the sequential lock so they can run WHILE a
+        handler holds it: stop/ask button callbacks, and text answers to a pending
+        AskUserQuestion (else the answer deadlocks behind the awaiting question run)."""
         if not isinstance(update, Update):
             return False
         cb = update.callback_query
-        return (
-            cb is not None
-            and cb.data is not None
-            and cb.data.startswith(cls._PRIORITY_PREFIXES)
-        )
+        if cb is not None and cb.data is not None and cb.data.startswith(cls._PRIORITY_PREFIXES):
+            return True
+        msg = update.message
+        # Любое сообщение (текст ИЛИ голос/др.), когда в чате/топике висит вопрос —
+        # потенциальный ответ; должно обойти лок, иначе застрянет за ожидающим прогоном.
+        # Раньше проверялся только msg.text → голосовой ответ не проходил.
+        if msg is not None:
+            from .ask_user import has_pending
+            if has_pending(msg.chat.id, msg.message_thread_id):
+                return True
+        return False
 
     async def do_process_update(
         self,
@@ -55,7 +63,7 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         coroutine: Awaitable[Any],
     ) -> None:
         """Process an update, applying sequential lock for non-priority updates."""
-        if self._is_priority_callback(update):
+        if self._is_priority(update):
             # Run immediately -- no sequential lock
             await coroutine
         else:
