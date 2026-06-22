@@ -40,7 +40,11 @@ class DiscoveredSkill:
 
 
 def _normalize(raw_name: str) -> str:
-    return raw_name.strip().lower().replace(" ", "_").replace("-", "_")
+    # Telegram command names must match ^[a-z0-9_]{1,32}$ — collapse every run
+    # of other chars (spaces, dashes, DOTS, etc.) to a single underscore so
+    # dotted skill names like ``karim.ai`` / ``huskarl.evo`` become valid.
+    name = re.sub(r"[^a-z0-9_]+", "_", raw_name.strip().lower())
+    return name.strip("_")[:32]
 
 
 def _iter_skill_files(project_dir: Path) -> Iterable[Tuple[Path, str]]:

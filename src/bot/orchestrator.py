@@ -505,6 +505,10 @@ class MessageOrchestrator:
                 if skill.argument_hint:
                     desc = f"{desc} ({skill.argument_hint})"
                 commands.append(BotCommand(skill_name, desc[:256]))
+            # Telegram rejects setMyCommands with more than 100 commands.
+            if len(commands) > 100:
+                logger.warning("Bot commands exceed Telegram 100 limit; keeping first 100", total=len(commands))
+                commands = commands[:100]
             return commands
         else:
             commands = [

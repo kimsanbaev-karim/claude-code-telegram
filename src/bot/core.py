@@ -107,10 +107,17 @@ class ClaudeCodeBot:
         logger.info("Bot initialization complete")
 
     async def _set_bot_commands(self) -> None:
-        """Set bot command menu via orchestrator."""
+        """Set bot command menu via orchestrator.
+
+        The command menu is cosmetic — a rejected setMyCommands (e.g. an
+        invalid name or >100 commands) must not crash bot startup.
+        """
         commands = await self.orchestrator.get_bot_commands()
-        await self.app.bot.set_my_commands(commands)
-        logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
+        try:
+            await self.app.bot.set_my_commands(commands)
+            logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
+        except Exception as e:
+            logger.warning("Failed to set bot commands; continuing without menu", error=str(e))
 
     def _register_handlers(self) -> None:
         """Register handlers via orchestrator (mode-aware)."""
