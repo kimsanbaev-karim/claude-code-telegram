@@ -69,6 +69,7 @@ async def handle_callback_query(
             "export": handle_export_callback,
             "model": lambda q, p, ctx: _handle_model_selection(q, f"model:{p}", ctx),
             "effort": lambda q, p, ctx: _handle_model_selection(q, f"effort:{p}", ctx),
+            "ask": handle_ask_callback,
         }
 
         handler = handlers.get(action)
@@ -106,9 +107,23 @@ async def handle_callback_query(
             )
 
 
-async def handle_cd_callback(
-    query, project_name: str, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def handle_ask_callback(query, param, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resolve an AskUserQuestion choice from inline buttons (ask:<qid>:<idx>)."""
+    from ..ask_user import resolve as _resolve_ask
+
+    try:
+        qid, idx_raw = (param or "").split(":", 1)
+        idx = int(idx_raw)
+    except (ValueError, AttributeError):
+        return
+    chosen = _resolve_ask(qid, idx)
+    if chosen is None:
+        await query.edit_message_text("⌛ Этот вопрос уже неактуален.")
+        return
+    await query.edit_message_text(f"✅ Выбрано: {chosen}")
+
+
+async def handle_cd_callback(query, project_name: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle directory change from inline keyboard."""
     user_id = query.from_user.id
     settings: Settings = context.bot_data["settings"]
