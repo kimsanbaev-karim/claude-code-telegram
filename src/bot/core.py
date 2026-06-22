@@ -12,14 +12,7 @@ from typing import Any, Callable, Dict, Optional
 
 import structlog
 from telegram import Update
-from telegram.ext import (
-    AIORateLimiter,
-    Application,
-    ContextTypes,
-    Defaults,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import AIORateLimiter, Application, ContextTypes, Defaults, MessageHandler, PersistenceInput, PicklePersistence, filters
 
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
@@ -75,6 +68,17 @@ class ClaudeCodeBot:
         if proxy_url:
             builder.proxy(proxy_url)
             logger.info("Proxy configured", proxy=proxy_url)
+
+        # Persist user_data/chat_data across restarts. context.user_data holds the
+        # per-topic Claude sessions (thread_state) + current_directory; without
+        # persistence they are in-memory only and lost on every process restart —
+        # the root cause of "session started fresh" / lost conversation context.
+        # bot_data is EXCLUDED: it carries unpicklable service objects (_inject_deps).
+        from pathlib import Path as _Path
+
+        _Path("data").mkdir(exist_ok=True)
+        _persist_store = PersistenceInput(bot_data=False, chat_data=True, user_data=True, callback_data=False)
+        builder.persistence(PicklePersistence(filepath="data/ptb_persistence.pkl", store_data=_persist_store, update_interval=30))
 
         self.app = builder.build()
 
