@@ -989,10 +989,18 @@ class MessageOrchestrator:
         if not files and not rejected:
             return
 
+        # ``O_NOFOLLOW`` (refuse symlinks) is POSIX-only and ``O_BINARY``
+        # (no CRLF translation) is Windows-only; guard both with getattr so
+        # the TOCTOU-safe open works cross-platform. On Windows O_NOFOLLOW is
+        # absent (-> 0) and O_BINARY keeps binary files byte-exact.
+        open_flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        )
+
         failed: List[str] = []
         for attachment in files:
             try:
-                fd = os.open(str(attachment.path), os.O_RDONLY | os.O_NOFOLLOW)
+                fd = os.open(str(attachment.path), open_flags)
             except OSError as e:
                 logger.warning(
                     "TOCTOU-safe open failed for MCP document",
