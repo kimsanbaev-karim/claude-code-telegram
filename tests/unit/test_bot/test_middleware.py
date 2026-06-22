@@ -37,6 +37,7 @@ def mock_settings():
     settings.approved_directory = "/tmp/test"
     settings.chunk_buffer_timeout = 0.5
     settings.chunk_buffer_threshold = 4000
+    settings.media_group_buffer_timeout = 1.0
     return settings
 
 
