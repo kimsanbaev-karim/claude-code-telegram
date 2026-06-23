@@ -609,11 +609,17 @@ async def handle_text_message(
             from pathlib import Path as _P
 
             failed_files: list[str] = []
+            # O_NOFOLLOW (refuse symlinks) is POSIX-only and O_BINARY is
+            # Windows-only; guard both with getattr so the TOCTOU-safe open
+            # works cross-platform (on Windows O_NOFOLLOW is absent -> 0).
+            open_flags = (
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            )
             for attachment in mcp_files:
                 # TOCTOU-safe: refuse to send if path was swapped (symlink,
                 # replacement) between validation and delivery.
                 try:
-                    fd = os.open(str(attachment.path), os.O_RDONLY | os.O_NOFOLLOW)
+                    fd = os.open(str(attachment.path), open_flags)
                 except OSError as file_err:
                     logger.warning(
                         "TOCTOU-safe open failed for MCP document",
