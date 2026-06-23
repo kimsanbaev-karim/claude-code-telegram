@@ -36,6 +36,7 @@ class VoiceHandler:
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
         self._resolved_whisper_binary: Optional[str] = None
+        self._faster_whisper_model: Optional[Any] = None
 
     def _ensure_allowed_file_size(self, file_size: Optional[int]) -> None:
         """Reject files that exceed the configured max size."""
@@ -87,7 +88,9 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "local":
+        if self.config.voice_provider == "faster-whisper":
+            transcription = await self._transcribe_faster_whisper(voice_bytes)
+        elif self.config.voice_provider == "local":
             transcription = await self._transcribe_local(voice_bytes)
         elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
@@ -202,6 +205,37 @@ class VoiceHandler:
         # PATCH (Karim): custom base_url lets a Groq key drive Whisper without an OpenAI key.
         self._openai_client = AsyncOpenAI(api_key=api_key, base_url=self.config.openai_base_url or None)
         return self._openai_client
+
+    # -- faster-whisper provider (local, no network — mirrors HuskarlBot) --
+
+    async def _transcribe_faster_whisper(self, voice_bytes: bytes) -> str:
+        """Transcribe locally with faster-whisper (no network dependency)."""
+        return await asyncio.to_thread(self._faster_whisper_sync, voice_bytes)
+
+    def _faster_whisper_sync(self, voice_bytes: bytes) -> str:
+        model = self._load_faster_whisper_model()
+        tmp_dir = tempfile.mkdtemp(prefix="voice_")
+        try:
+            ogg_path = Path(tmp_dir) / "voice.ogg"
+            ogg_path.write_bytes(voice_bytes)
+            # faster-whisper decodes ogg/opus via PyAV; language auto-detected.
+            segments, _ = model.transcribe(str(ogg_path))
+            text = " ".join(seg.text for seg in segments).strip()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if not text:
+            raise ValueError("faster-whisper transcription returned an empty response.")
+        return text
+
+    def _load_faster_whisper_model(self) -> Any:
+        """Lazily load + cache the faster-whisper model (CPU, int8)."""
+        if self._faster_whisper_model is None:
+            from faster_whisper import WhisperModel
+
+            model_name = self.config.voice_transcription_model or "base"
+            logger.info("Loading faster-whisper model", model=model_name)
+            self._faster_whisper_model = WhisperModel(model_name, compute_type="int8", device="cpu")
+        return self._faster_whisper_model
 
     # -- Local whisper.cpp provider --
 

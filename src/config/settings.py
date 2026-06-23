@@ -203,9 +203,9 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai", "local"] = Field(
+    voice_provider: Literal["mistral", "openai", "local", "faster-whisper"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral', 'openai', or 'local'",
+        description="Voice transcription provider: 'mistral', 'openai', 'local' (whisper.cpp), or 'faster-whisper' (local, no network)",
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -485,10 +485,8 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai", "local"}:
-            raise ValueError(
-                "voice_provider must be one of ['mistral', 'openai', 'local']"
-            )
+        if provider not in {"mistral", "openai", "local", "faster-whisper"}:
+            raise ValueError("voice_provider must be one of ['mistral', 'openai', 'local', 'faster-whisper']")
         return provider
 
     @field_validator("project_threads_chat_id", mode="before")
