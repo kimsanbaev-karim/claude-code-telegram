@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -579,12 +580,22 @@ class ClaudeSDKManager:
                     previous_session_id=session_id,
                 )
 
-            # Use ResultMessage.result if available, fall back to message extraction
+            # Use ResultMessage.result if available, fall back to message
+            # extraction. Strip leaked ``[ThinkingBlock(...)]`` reprs that some
+            # CLI versions embed in the result text (cherry-pick from PR #152).
             if result_content is not None:
-                content = str(result_content).strip()
+                content = re.sub(
+                    r"\[ThinkingBlock\(thinking='.*?',\s*signature='.*?'\)\]\s*",
+                    "",
+                    str(result_content),
+                    flags=re.DOTALL,
+                ).strip()
             else:
+                # Use only the LAST AssistantMessage's text — earlier assistant
+                # messages are intermediate reasoning already streamed live, so
+                # repeating them at the end is noise (cherry-pick from PR #152).
                 content_parts = []
-                for msg in messages:
+                for msg in reversed(messages):
                     if isinstance(msg, AssistantMessage):
                         msg_content = getattr(msg, "content", [])
                         if msg_content and isinstance(msg_content, list):
@@ -593,6 +604,8 @@ class ClaudeSDKManager:
                                     content_parts.append(block.text)
                         elif msg_content:
                             content_parts.append(str(msg_content))
+                        if content_parts:
+                            break
                 content = "\n".join(content_parts).strip()
 
             if not content and tools_used:
