@@ -79,6 +79,7 @@ class Settings(BaseSettings):
         None,
         description="Anthropic API key for SDK (optional if CLI logged in)",
     )
+    anthropic_base_url: Optional[str] = Field(None, description="Custom base URL for the Anthropic API (proxy / alt provider)")
     claude_model: Optional[str] = Field(
         None, description="Claude model to use (defaults to CLI default if unset)"
     )
@@ -577,6 +578,11 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+    @property
+    def anthropic_base_url_str(self) -> Optional[str]:
+        """Custom Anthropic API base URL, if configured."""
+        return self.anthropic_base_url
 
     @property
     def mistral_api_key_str(self) -> Optional[str]:
