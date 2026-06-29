@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir poetry==${POETRY_VERSION}
 # Layer 4: Create non-privileged user and directories
 # ---------------------------------------------------------------------------
 RUN groupadd --gid 1000 bot \
-    && useradd --uid 1000 --gid 1000 --no-create-home --shell /bin/bash bot \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash bot \
     && mkdir -p /app /work \
     && chown bot:bot /app /work
 
