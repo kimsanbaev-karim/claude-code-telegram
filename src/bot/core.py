@@ -29,11 +29,14 @@ def _write_heartbeat() -> None:
     Путь задаётся через HEARTBEAT_FILE (по умолчанию /data/heartbeat).
     Вызывается из polling-цикла каждые ~30 секунд.
     """
+    import time as _time
     heartbeat_path = os.environ.get("HEARTBEAT_FILE", "/data/heartbeat")
     try:
-        os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
+        parent = os.path.dirname(heartbeat_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(heartbeat_path, "w") as f:
-            f.write(str(int(asyncio.get_event_loop().time())))
+            f.write(str(int(_time.time())))
     except OSError as exc:
         logger.warning("Failed to write heartbeat", path=heartbeat_path, error=str(exc))
 
