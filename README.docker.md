@@ -43,21 +43,20 @@
 ## 3. Аутентификация Claude (headless OAuth)
 
 ### Получение токена
-На машине с авторизованным Claude Code выполнить:
-```bash
-claude setup-token
-```
-Скопировать выведенный токен.
+1. На машине с авторизованным Claude Code выполнить:
+   ```bash
+   claude setup-token
+   ```
+   Команда интерактивно запрашивает подтверждение и выводит токен.
 
-### Размещение токена
-Поместить в `.env` файл на VPS:
-```
-CLAUDE_CODE_OAUTH_TOKEN=<ваш_токен_здесь>
-```
+2. Скопировать токен и поместить в `.env` на VPS:
+   ```
+   CLAUDE_CODE_OAUTH_TOKEN=<токен из claude setup-token>
+   ```
 
-### Важные правила
-- **НЕ устанавливать** `ANTHROPIC_API_KEY` одновременно с `CLAUDE_CODE_OAUTH_TOKEN` — они конфликтуют
-- Токен **годовой**: зафиксировать дату получения, поставить напоминание за 30 дней до истечения
+3. **НЕ устанавливать** `ANTHROPIC_API_KEY` одновременно с `CLAUDE_CODE_OAUTH_TOKEN` — они конфликтуют.
+
+4. Токен действует **~1 год**. Зафиксировать дату получения, поставить напоминание за 30 дней.
 
 ### Диагностика протухшего токена
 В логах контейнера появятся строки:
@@ -91,33 +90,63 @@ Invalid token
 
 ---
 
-## 5. Vault — Obsidian Sync headless
+## 5. Vault — синхронизация через obsidian-headless
 
-Vault Basic Memory синхронизируется через `obsidian-headless` (npm-пакет). Это **ручная операция** пользователя при первоначальной настройке.
+Vault Basic Memory синхронизируется через официальный пакет `obsidian-headless`
+([github.com/obsidianmd/obsidian-headless](https://github.com/obsidianmd/obsidian-headless),
+документация: https://obsidian.md/help/sync/headless).
 
-### Установка и настройка
-```bash
-# Установить obsidian-headless на VPS
-npm install -g obsidian-headless
+Запускается как **отдельный sidecar-контейнер** (НЕ встроен в образ бота) — требует Node.js 22+.
+`ob login` — ручная операция пользователя (требует подписку Obsidian Sync).
 
-# Настроить с учётными данными Obsidian Sync (пользователь вводит сам)
-obsidian-headless login
+### Пример добавления sidecar в `docker-compose.yml`
 
-# Указать путь к vault (должен совпадать с vault на ноуте)
-obsidian-headless sync --vault /path/to/vault --daemon
+> Документация к конфигурации; в текущий compose-файл добавляется по желанию пользователя.
+
+```yaml
+  obsidian-sync:
+    image: node:22-slim
+    container_name: obsidian-sync
+    restart: unless-stopped
+    command: >
+      sh -c "npm install -g obsidian-headless && ob sync"
+    volumes:
+      - ./vault:/vault
+      - obsidian-config:/root/.config/obsidian-headless
+    environment:
+      - OBSIDIAN_VAULT_PATH=/vault
+
+volumes:
+  obsidian-config:
 ```
 
-### Исключения из синхронизации (важно!)
-- `*.db` и `*.sqlite` — SQLite-индекс Basic Memory **не синхронизируется**
-- Каждая сторона (ноут / VPS) переиндексирует vault самостоятельно после получения файлов
+### Настройка (ручные операции пользователя)
+
+```bash
+# Первичная настройка на VPS (один раз)
+docker run --rm -it \
+  -v obsidian-config:/root/.config/obsidian-headless \
+  node:22-slim \
+  sh -c "npm install -g obsidian-headless && ob login && ob sync-setup --vault '<имя vault>'"
+# ob login — интерактивный вход в аккаунт Obsidian (подписка пользователя)
+# ob sync-setup — выбор vault для синхронизации
+```
+
+### Исключения из синхронизации (критически важно)
+
+- SQLite-индекс Basic Memory (`*.db`, `*.sqlite`) **не синхронизировать**
+- Каждая сторона (ноут / VPS) переиндексирует vault самостоятельно
+- Для исключения создать `.obsidian/app.json` с настройкой excluded patterns, либо хранить SQLite вне vault-директории
 
 ### Модель конфликтов
-Obsidian Sync создаёт conflict copies при одновременной правке с обеих сторон — данные не теряются молча.
 
-### Критерий приёмки
-- Запись заметки на ноуте → через несколько секунд файл появляется на VPS
+Obsidian Sync создаёт conflict copies при одновременной правке — данные не теряются молча.
+
+### Критерий приёмки (после настройки)
+
+- Запись в vault на ноуте → через несколько секунд файл появляется на VPS
 - Запись бота на VPS → через несколько секунд файл появляется на ноуте
-- `*.db` / `*.sqlite` не синхронизируются (ожидаемое поведение)
+- `*.db` / `*.sqlite` не синхронизируются
 
 ---
 
