@@ -84,7 +84,7 @@ Invalid token
 ### Структура томов
 ```
 ./data/       → /data        (rw)  — SQLite БД, task_threads.json, heartbeat
-./config/     → /config      (ro)  — конфигурация агента
+./config/     → /app/config  (ro)  — конфигурация агента
 ./secrets/    → /secrets     (ro)  — Google SA, SSH-ключи
 ./work/       → /work        (rw)  — рабочие клоны репо
 ```
@@ -180,7 +180,8 @@ Docker включён в автозапуск (`systemctl enable docker`) → к
 ### Диагностика
 ```bash
 # Статус healthcheck
-docker inspect claude-telegram-bot | grep -A5 Health
+docker inspect $(docker compose ps -q bot) | grep -A5 Health
+docker ps --format 'table {{.Names}}\t{{.Status}}'
 
 # Лог autoheal sidecar
 docker compose logs autoheal --tail=20
@@ -227,6 +228,8 @@ docker compose logs -f bot --tail=20
 # Архивировать данные бота
 tar -czf backup-$(date +%Y%m%d).tar.gz ./data/ ./config/ ./secrets/
 ```
+> **Важно:** `.env` не включён в архив (содержит секреты). Храни отдельную защищённую копию `.env` (например, в password manager). При восстановлении потребуется заново заполнить все переменные окружения.
+
 Vault (Basic Memory) синхронизируется через Obsidian Sync — он сам является распределённым бэкапом.
 
 ### Восстановление с нуля
