@@ -94,7 +94,7 @@
 **Сложность**: complex
 **RED**: двусторонний Syncthing + SQLite-индекс Basic Memory → `.sync-conflict`/коррупция индекса.
 **GREEN**: зафиксирована модель **Obsidian Sync headless** (двусторонняя, мгновенная, E2E):
-- `obsidian-headless` npm-пакет запускается как systemd-сервис или docker-sidecar на VPS
+- `obsidian-headless` (официальный пакет, github.com/obsidianmd/obsidian-headless, docs: https://obsidian.md/help/sync/headless) запускается как **отдельный docker-sidecar** (profile: vault) с Node.js 22+; команды: `ob login` → `ob sync-setup` → `ob sync`
 - синхронизируются только markdown-файлы vault; SQLite-индекс Basic Memory (`*.db`, `*.sqlite`) **исключён** из синхронизации
 - каждая сторона (ноут / VPS) переиндексирует vault самостоятельно после получения изменений
 - конфликты при одновременной правке — разрешаются встроенным механизмом версий Obsidian Sync (conflict copies), не теряются молча

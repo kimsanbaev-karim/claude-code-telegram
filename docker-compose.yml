@@ -44,3 +44,18 @@ services:
       - AUTOHEAL_START_PERIOD=30
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+  obsidian-sync:
+    image: node:22-slim
+    container_name: obsidian-sync
+    restart: unless-stopped
+    command: >
+      sh -c "npm install -g obsidian-headless && ob sync"
+    volumes:
+      - ./vault:/vault
+      - obsidian-config:/root/.config/obsidian-headless
+    profiles:
+      - vault
+
+volumes:
+  obsidian-config:
