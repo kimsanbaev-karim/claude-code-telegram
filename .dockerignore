@@ -1,0 +1,60 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs
+*.log
+logs/
+
+# Runtime data (mounted as volumes)
+data/
+work/
+
+# Config (mounted as volume)
+config/
+
+# Git
+.git/
+.gitignore
+
+# Environment files (NEVER bake secrets into image)
+.env
+.env.*
+!.env.example
+
+# Tests and coverage
+tests/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Documentation (not needed in image)
+*.md
+!README.md
+docs/
+plans/
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

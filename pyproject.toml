@@ -58,6 +58,7 @@ faster-whisper = {version = "^1.0.0", optional = true}
 
 [tool.poetry.extras]
 voice = ["mistralai", "openai", "faster-whisper"]
+voice_groq = ["openai"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.0"
