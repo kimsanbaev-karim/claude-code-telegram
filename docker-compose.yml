@@ -1,0 +1,46 @@
+# docker-compose.yml — claude-code-telegram, always-on 24/7 агент
+#
+# Активация при старте системы:
+#   sudo systemctl enable docker   # один раз на VPS
+#   docker compose up -d           # первый запуск
+#
+# После этого контейнер поднимается автоматически при ребуте VPS.
+
+services:
+  bot:
+    image: claude-telegram-bot:latest
+    container_name: claude-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Рабочая директория агента (клоны репо, временные файлы)
+      - ./work:/work
+      # Персистентные данные (SQLite БД, task_threads.json, heartbeat)
+      - ./data:/data
+      # Конфиги приложения (projects.yaml, mcp-config.json)
+      - ./config:/app/config:ro
+      # Секреты (Google credentials и др.) — read-only, вне /work
+      - ./secrets:/secrets:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+      - AUTOHEAL_INTERVAL=10
+      - AUTOHEAL_START_PERIOD=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

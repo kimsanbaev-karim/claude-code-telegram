@@ -41,8 +41,8 @@ RUN pip install --no-cache-dir poetry==${POETRY_VERSION}
 # ---------------------------------------------------------------------------
 RUN groupadd --gid 1000 bot \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash bot \
-    && mkdir -p /app /work \
-    && chown bot:bot /app /work
+    && mkdir -p /app /work /data \
+    && chown bot:bot /app /work /data
 
 WORKDIR /app
 
@@ -64,6 +64,12 @@ COPY --chown=bot:bot README.md ./
 COPY --chown=bot:bot src/ ./src/
 
 RUN pip install --no-cache-dir --no-build-isolation .
+
+# ---------------------------------------------------------------------------
+# Layer 7: Healthcheck script
+# ---------------------------------------------------------------------------
+COPY --chown=bot:bot healthcheck.sh /app/healthcheck.sh
+RUN chmod +x /app/healthcheck.sh
 
 # ---------------------------------------------------------------------------
 # Runtime

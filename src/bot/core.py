@@ -8,6 +8,7 @@ Features:
 """
 
 import asyncio
+import os
 from typing import Any, Callable, Dict, Optional
 
 import structlog
@@ -20,6 +21,21 @@ from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
 
 logger = structlog.get_logger()
+
+
+def _write_heartbeat() -> None:
+    """Обновляет heartbeat-файл текущим временем.
+
+    Путь задаётся через HEARTBEAT_FILE (по умолчанию /data/heartbeat).
+    Вызывается из polling-цикла каждые ~30 секунд.
+    """
+    heartbeat_path = os.environ.get("HEARTBEAT_FILE", "/data/heartbeat")
+    try:
+        os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
+        with open(heartbeat_path, "w") as f:
+            f.write(str(int(asyncio.get_event_loop().time())))
+    except OSError as exc:
+        logger.warning("Failed to write heartbeat", path=heartbeat_path, error=str(exc))
 
 
 class ClaudeCodeBot:
@@ -248,8 +264,13 @@ class ClaudeCodeBot:
                 )
 
                 # Keep running until manually stopped
+                _heartbeat_counter = 0
                 while self.is_running:
                     await asyncio.sleep(1)
+                    _heartbeat_counter += 1
+                    if _heartbeat_counter >= 30:
+                        _heartbeat_counter = 0
+                        _write_heartbeat()
         except Exception as e:
             logger.error("Error running bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
