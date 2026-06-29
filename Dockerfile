@@ -60,6 +60,7 @@ RUN poetry install --only main --extras voice_groq --no-root
 # ---------------------------------------------------------------------------
 # Layer 6: Application source
 # ---------------------------------------------------------------------------
+COPY --chown=bot:bot README.md ./
 COPY --chown=bot:bot src/ ./src/
 
 RUN pip install --no-cache-dir --no-build-isolation .
