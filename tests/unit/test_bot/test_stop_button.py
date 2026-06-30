@@ -73,23 +73,30 @@ class TestActiveRequest:
 class TestStopCallback:
     """_handle_stop_callback routing logic."""
 
+    @staticmethod
+    def _topic_update(query, chat_id=500, thread_id=7):
+        """Build a callback update whose topic resolves to (chat_id, thread_id)."""
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = chat_id
+        update.effective_message = MagicMock()
+        update.effective_message.message_thread_id = thread_id
+        return update
+
     async def test_owner_can_stop(self, orchestrator):
-        """Clicking Stop fires the interrupt event."""
+        """Clicking Stop fires the interrupt event for THIS topic's run."""
         event = asyncio.Event()
         progress_msg = AsyncMock()
-        active = ActiveRequest(
-            user_id=100, interrupt_event=event, progress_msg=progress_msg
-        )
-        orchestrator._active_requests[100] = active
+        active = ActiveRequest(user_id=100, interrupt_event=event, progress_msg=progress_msg)
+        orchestrator._active_requests[(500, 7)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
         query.from_user = MagicMock()
         query.from_user.id = 100
 
-        update = MagicMock()
-        update.callback_query = query
-
+        update = self._topic_update(query)
         context = MagicMock()
         context.bot_data = {}
 
@@ -98,25 +105,39 @@ class TestStopCallback:
         assert event.is_set()
         assert active.interrupted is True
         query.answer.assert_awaited_once_with("Stopping...", show_alert=False)
-        progress_msg.edit_text.assert_awaited_once_with(
-            "Stopping...", reply_markup=None
-        )
+        progress_msg.edit_text.assert_awaited_once_with("Stopping...", reply_markup=None)
+
+    async def test_stop_only_affects_its_own_topic(self, orchestrator):
+        """A Stop in one topic must not interrupt a run in another topic."""
+        ev_a, ev_b = asyncio.Event(), asyncio.Event()
+        active_a = ActiveRequest(user_id=100, interrupt_event=ev_a, progress_msg=AsyncMock())
+        active_b = ActiveRequest(user_id=100, interrupt_event=ev_b, progress_msg=AsyncMock())
+        orchestrator._active_requests[(500, 7)] = active_a
+        orchestrator._active_requests[(500, 9)] = active_b  # other topic
+
+        query = AsyncMock()
+        query.data = "stop:100"
+        query.from_user = MagicMock()
+        query.from_user.id = 100
+        update = self._topic_update(query, thread_id=7)  # stop in topic 7
+
+        await orchestrator._handle_stop_callback(update, MagicMock(bot_data={}))
+
+        assert ev_a.is_set() and active_a.interrupted is True
+        assert not ev_b.is_set() and not active_b.interrupted
 
     async def test_non_owner_blocked(self, orchestrator):
         """A different user cannot stop someone else's request."""
         event = asyncio.Event()
-        active = ActiveRequest(
-            user_id=100, interrupt_event=event, progress_msg=AsyncMock()
-        )
-        orchestrator._active_requests[100] = active
+        active = ActiveRequest(user_id=100, interrupt_event=event, progress_msg=AsyncMock())
+        orchestrator._active_requests[(500, 7)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
         query.from_user = MagicMock()
         query.from_user.id = 999  # different user
 
-        update = MagicMock()
-        update.callback_query = query
+        update = self._topic_update(query)
         context = MagicMock()
         context.bot_data = {}
 
@@ -124,9 +145,7 @@ class TestStopCallback:
 
         assert not event.is_set()
         assert not active.interrupted
-        query.answer.assert_awaited_once_with(
-            "Only the requesting user can stop this.", show_alert=True
-        )
+        query.answer.assert_awaited_once_with("Only the requesting user can stop this.", show_alert=True)
 
     async def test_stop_after_completion(self, orchestrator):
         """Clicking Stop after request completed is handled gracefully."""
@@ -135,8 +154,7 @@ class TestStopCallback:
         query.from_user = MagicMock()
         query.from_user.id = 100
 
-        update = MagicMock()
-        update.callback_query = query
+        update = self._topic_update(query)
         context = MagicMock()
         context.bot_data = {}
 
@@ -148,19 +166,16 @@ class TestStopCallback:
     async def test_double_stop_prevention(self, orchestrator):
         """Second click shows 'Already stopping...' instead of re-firing."""
         event = asyncio.Event()
-        active = ActiveRequest(
-            user_id=100, interrupt_event=event, progress_msg=AsyncMock()
-        )
+        active = ActiveRequest(user_id=100, interrupt_event=event, progress_msg=AsyncMock())
         active.interrupted = True  # already stopped once
-        orchestrator._active_requests[100] = active
+        orchestrator._active_requests[(500, 7)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
         query.from_user = MagicMock()
         query.from_user.id = 100
 
-        update = MagicMock()
-        update.callback_query = query
+        update = self._topic_update(query)
         context = MagicMock()
         context.bot_data = {}
 
@@ -285,7 +300,7 @@ class TestStopButtonOnProgress:
                     MockFmt.return_value.format_claude_response.return_value = []
                     await orchestrator.agentic_text(update, context)
 
-        assert user_id not in orchestrator._active_requests
+        assert not orchestrator._active_requests
 
     async def test_active_request_cleaned_up_after_error(self, orchestrator, settings):
         """_active_requests is cleared even when run_command raises."""
@@ -328,7 +343,7 @@ class TestStopButtonOnProgress:
             ):
                 await orchestrator.agentic_text(update, context)
 
-        assert user_id not in orchestrator._active_requests
+        assert not orchestrator._active_requests
 
 
 # ---------------------------------------------------------------------------

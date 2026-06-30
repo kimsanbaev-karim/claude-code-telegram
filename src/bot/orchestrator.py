@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -140,6 +140,7 @@ class ActiveRequest:
     interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
     interrupted: bool = False
     progress_msg: Any = None  # telegram Message object
+    started_at: float = field(default_factory=time.time)  # для /status: длительность задачи
 
 
 class MessageOrchestrator:
@@ -148,10 +149,16 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
-        self._active_requests: Dict[int, ActiveRequest] = {}
+        self._started_at: float = time.time()  # аптайм процесса бота для /status
+        # Active in-flight requests are tracked per TOPIC (chat_id, thread_id), not
+        # per user: one user has many topics that run concurrently, and Stop must
+        # target the right topic's run.
+        self._active_requests: Dict[Tuple[Optional[int], Optional[int]], ActiveRequest] = {}
         self._known_commands: frozenset[str] = frozenset()
         self._skills: Dict[str, DiscoveredSkill] = discover_skills(settings.approved_directory)
-        self._user_locks: Dict[int, asyncio.Lock] = {}
+        # One lock per topic so different Telegram topics process concurrently
+        # while messages inside a single topic stay ordered.
+        self._topic_locks: Dict[Tuple[Optional[int], Optional[int]], asyncio.Lock] = {}
         self._message_buffer = MessageBuffer(
             chunk_timeout=settings.chunk_buffer_timeout,
             chunk_threshold=settings.chunk_buffer_threshold,
@@ -199,7 +206,7 @@ class MessageOrchestrator:
                 await handler(update, context)
             finally:
                 if should_enforce:
-                    self._persist_thread_state(context)
+                    self._persist_thread_state(update, context)
 
         return wrapped
 
@@ -357,12 +364,23 @@ class MessageOrchestrator:
         }
         return True
 
-    def _persist_thread_state(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Persist compatibility keys back into per-thread state."""
+    def _persist_thread_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Persist compatibility keys back into per-thread state.
+
+        Concurrency-safe: only persists when the shared ``_thread_context`` still
+        belongs to THIS update's topic. If a concurrently-processed topic
+        overwrote the shared user_data keys mid-run, the agentic path already
+        wrote this topic's ``thread_state`` slot directly, so we skip rather than
+        write another topic's values into the wrong slot."""
         thread_context = context.user_data.get("_thread_context")
         if not thread_context:
             return
 
+        # Guard against cross-topic clobber of the shared keys.
+        if thread_context.get("state_key") != self._topic_state_key(update):
+            return
+
+        state_key = thread_context["state_key"]
         project_root = Path(thread_context["project_root"])
         current_dir = context.user_data.get("current_directory", project_root)
         if not isinstance(current_dir, Path):
@@ -372,11 +390,98 @@ class MessageOrchestrator:
             current_dir = project_root
 
         thread_states = context.user_data.setdefault("thread_state", {})
-        thread_states[thread_context["state_key"]] = {
-            "current_directory": str(current_dir),
-            "claude_session_id": context.user_data.get("claude_session_id"),
-            "project_slug": thread_context["project_slug"],
-        }
+        rec = dict(thread_states.get(state_key, {}))
+        rec["current_directory"] = str(current_dir)
+        rec["claude_session_id"] = context.user_data.get("claude_session_id")
+        rec["project_slug"] = thread_context["project_slug"]
+        rec["project_root"] = str(project_root)
+        if thread_context.get("project_name") is not None:
+            rec["project_name"] = thread_context["project_name"]
+        if "task_id" in thread_context:
+            rec["task_id"] = thread_context["task_id"]
+        thread_states[state_key] = rec
+
+    def _topic_state_key(self, update: Update) -> str:
+        """``"{chat_id}:{thread_id}"`` key for an update's topic.
+
+        Derived purely from the update (stable per call) so it is correct even
+        when the shared ``_thread_context`` was clobbered by a concurrent topic.
+        Matches the key routing writes in ``_apply_*_context``."""
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None) if chat is not None else None
+        thread_id = self._extract_message_thread_id(update)
+        return f"{chat_id}:{thread_id}"
+
+    def _capture_thread_snapshot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Copy routing's shared-key context into this topic's ``thread_state`` slot.
+
+        MUST run synchronously (before any await) so a concurrently-processed
+        topic cannot have overwritten the shared user_data keys yet. The agentic
+        path then reads/writes only the per-topic slot, immune to cross-topic
+        clobber of the shared keys."""
+        state_key = self._topic_state_key(update)
+        tc = context.user_data.get("_thread_context") or {}
+        thread_states = context.user_data.setdefault("thread_state", {})
+        rec = dict(thread_states.get(state_key, {}))
+        cur = context.user_data.get("current_directory", self.settings.approved_directory)
+        rec["current_directory"] = str(cur)
+        rec["claude_session_id"] = context.user_data.get("claude_session_id")
+        rec["project_root"] = tc.get("project_root", rec.get("project_root", str(self.settings.approved_directory)))
+        if tc.get("project_name") is not None:
+            rec["project_name"] = tc.get("project_name")
+        if tc.get("project_slug") is not None:
+            rec["project_slug"] = tc.get("project_slug")
+        if "task_id" in tc:
+            rec["task_id"] = tc["task_id"]
+        thread_states[state_key] = rec
+
+    def _thread_state_for(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, Dict[str, Any]]:
+        """Return ``(state_key, record)`` for this update's topic.
+
+        ``record`` is the live dict inside ``thread_state`` — mutate it in place
+        to persist session/cwd for THIS topic only. Synthesizes a record from the
+        shared keys when none exists (e.g. unit tests bypassing routing)."""
+        state_key = self._topic_state_key(update)
+        thread_states = context.user_data.setdefault("thread_state", {})
+        rec = thread_states.get(state_key)
+        if rec is None:
+            tc = context.user_data.get("_thread_context") or {}
+            cur = context.user_data.get("current_directory", self.settings.approved_directory)
+            rec = {
+                "current_directory": str(cur),
+                "claude_session_id": context.user_data.get("claude_session_id"),
+                "project_root": tc.get("project_root", str(self.settings.approved_directory)),
+            }
+            thread_states[state_key] = rec
+        return state_key, rec
+
+    def _resolve_cwd_change(self, content: str, current_dir: Path) -> Path:
+        """Return the cwd implied by cd-like mentions in Claude's response, or
+        *current_dir* unchanged. Pure (mutates no shared state) so it is safe to
+        run for concurrent per-topic runs — unlike the legacy
+        ``_update_working_directory_from_claude_response`` which writes the shared
+        ``context.user_data`` key."""
+        patterns = [
+            r"(?:^|\n).*?cd\s+([^\s\n]+)",
+            r"(?:^|\n).*?Changed directory to:?\s*([^\s\n]+)",
+            r"(?:^|\n).*?Current directory:?\s*([^\s\n]+)",
+            r"(?:^|\n).*?Working directory:?\s*([^\s\n]+)",
+        ]
+        text = content.lower()
+        approved = self.settings.approved_directory
+        for pattern in patterns:
+            for match in re.findall(pattern, text, re.MULTILINE | re.IGNORECASE):
+                try:
+                    raw = match.strip().strip("\"'`")
+                    if raw.startswith(("./", "../")) or not raw.startswith("/"):
+                        candidate = (current_dir / raw).resolve()
+                    else:
+                        candidate = Path(raw).resolve()
+                    if candidate.is_relative_to(approved) and candidate.exists():
+                        return candidate
+                except (ValueError, OSError):
+                    continue
+        return current_dir
 
     @staticmethod
     def _is_within(path: Path, root: Path) -> bool:
@@ -709,30 +814,44 @@ class MessageOrchestrator:
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        dir_display = str(current_dir)
+        """Статус бота: выполняет задачу / простаивает, аптайм, активные задачи, сессия.
 
-        session_id = context.user_data.get("claude_session_id")
-        session_status = "active" if session_id else "none"
+        Отчёт ГЛОБАЛЬНЫЙ (по всем топикам) — чтобы можно было мониторить, занят
+        бот или простаивает, и сколько идут активные прогоны."""
+        now = time.time()
 
-        # Cost info
+        # Активные прогоны (по всем топикам), исключая уже прерванные.
+        active = [(k, r) for k, r in self._active_requests.items() if not r.interrupted]
+
+        # Аптайм процесса бота.
+        up = int(now - self._started_at)
+        uptime_str = f"{up // 3600}ч {(up % 3600) // 60}м" if up >= 3600 else f"{(up % 3600) // 60}м {up % 60}с"
+
+        if active:
+            head = f"🟢 Выполняет задач: {len(active)}"
+        else:
+            head = "🟡 Простаивает (готов к работе)"
+
+        lines = ["🤖 Статус бота", head, f"⏱ Аптайм: {uptime_str}"]
+        for (chat_id, thread_id), r in active:
+            dur = int(now - r.started_at)
+            lines.append(f"  • топик {chat_id}:{thread_id} — {dur}с в работе")
+
+        # Сессия/папка/стоимость текущего топика.
+        current_dir = context.user_data.get("current_directory", self.settings.approved_directory)
+        session_status = "active" if context.user_data.get("claude_session_id") else "none"
         cost_str = ""
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             try:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
-                cost_usage = user_status.get("cost_usage", {})
-                current_cost = cost_usage.get("current", 0.0)
+                current_cost = user_status.get("cost_usage", {}).get("current", 0.0)
                 cost_str = f" · Cost: ${current_cost:.2f}"
             except Exception:
                 pass
+        lines.append(f"📂 {current_dir} · Session: {session_status}{cost_str}")
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        await update.message.reply_text("\n".join(lines))
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -1230,12 +1349,16 @@ class MessageOrchestrator:
             except Exception as e:
                 logger.debug("Failed to send document error summary", error=str(e))
 
-    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
-        """Return a per-user lock, creating one if needed."""
-        lock = self._user_locks.get(user_id)
+    def _get_topic_lock(self, chat_id: Optional[int], thread_id: Optional[int]) -> asyncio.Lock:
+        """Return a per-topic ``(chat_id, thread_id)`` lock, creating one if needed.
+
+        Per topic (not per user) so different Telegram topics run concurrently
+        while messages within one topic stay ordered."""
+        key = (chat_id, thread_id)
+        lock = self._topic_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._user_locks[user_id] = lock
+            self._topic_locks[key] = lock
         return lock
 
     async def agentic_text(
@@ -1268,6 +1391,13 @@ class MessageOrchestrator:
             user_id=user_id,
             message_length=len(message_text),
         )
+
+        # Snapshot this topic's routed context (cwd/session/project) into its
+        # per-topic thread_state slot NOW — synchronously, before any await.
+        # Routing populated the *shared* user_data keys; a concurrently-processed
+        # topic will overwrite them at the next await, so the agentic path reads
+        # from the per-(chat,thread) slot instead.
+        self._capture_thread_snapshot(update, context)
 
         # Rate limit check (runs on every chunk — cheap)
         rate_limiter = context.bot_data.get("rate_limiter")
@@ -1309,7 +1439,7 @@ class MessageOrchestrator:
                 )
 
         # --- Process (may also be called from _on_buffer_flush) ------------
-        lock = self._get_user_lock(user_id)
+        lock = self._get_topic_lock(chat_id, thread_id)
         async with lock:
             await self._process_agentic_text(update, context, message_text)
 
@@ -1325,11 +1455,10 @@ class MessageOrchestrator:
             chunk_count=result.chunk_count,
             combined_length=len(result.combined_text),
         )
-        lock = self._get_user_lock(key[0])
+        # key == (user_id, chat_id, thread_id) -> lock on the topic.
+        lock = self._get_topic_lock(key[1], key[2])
         async with lock:
-            await self._process_agentic_text(
-                result.first_update, result.last_context, result.combined_text
-            )
+            await self._process_agentic_text(result.first_update, result.last_context, result.combined_text)
 
     async def _process_agentic_text(
         self,
@@ -1348,36 +1477,29 @@ class MessageOrchestrator:
 
         verbose_level = self._get_verbose_level(context)
 
+        # Per-topic state: read cwd/session from THIS topic's slot, not the shared
+        # user_data keys (which a concurrently-processed topic may have overwritten).
+        state_key, tstate = self._thread_state_for(update, context)
+        topic_key = (chat.id, self._extract_message_thread_id(update))
+
         # Create Stop button and interrupt event
         interrupt_event = asyncio.Event()
-        stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
-        )
-        progress_msg = await update.message.reply_text(
-            "Working...", reply_markup=stop_kb
-        )
+        stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]])
+        progress_msg = await update.message.reply_text("Working...", reply_markup=stop_kb)
 
-        # Register active request for stop callback
-        active_request = ActiveRequest(
-            user_id=user_id,
-            interrupt_event=interrupt_event,
-            progress_msg=progress_msg,
-        )
-        self._active_requests[user_id] = active_request
+        # Register active request for stop callback (keyed per topic)
+        active_request = ActiveRequest(user_id=user_id, interrupt_event=interrupt_event, progress_msg=progress_msg)
+        self._active_requests[topic_key] = active_request
 
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
-            self._active_requests.pop(user_id, None)
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration.",
-                reply_markup=None,
-            )
+            self._active_requests.pop(topic_key, None)
+            await progress_msg.edit_text("Claude integration not available. Check configuration.", reply_markup=None)
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+        _cwd_raw = tstate.get("current_directory") or self.settings.approved_directory
+        current_dir = Path(_cwd_raw)
+        session_id = tstate.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1455,14 +1577,13 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
+            # Persist session + cwd into THIS topic's slot (concurrency-safe);
+            # mirror into the shared keys for same-topic continuity / persist.
+            new_cwd = self._resolve_cwd_change(claude_response.content, current_dir)
+            tstate["claude_session_id"] = claude_response.session_id
+            tstate["current_directory"] = str(new_cwd)
             context.user_data["claude_session_id"] = claude_response.session_id
-
-            # Track directory changes
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
+            context.user_data["current_directory"] = new_cwd
 
             # Store interaction
             storage = context.bot_data.get("storage")
@@ -1502,7 +1623,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
-            self._active_requests.pop(user_id, None)
+            self._active_requests.pop(topic_key, None)
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1619,6 +1740,8 @@ class MessageOrchestrator:
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
         user_id = update.effective_user.id
+        # Capture this topic's routed context before any await (concurrency-safe).
+        self._capture_thread_snapshot(update, context)
         document = update.message.document
 
         logger.info(
@@ -1650,9 +1773,9 @@ class MessageOrchestrator:
         # current_dir is needed by the document branch of file_handler to persist
         # binary uploads (PDF etc.) into <current_dir>/.uploads/ where Claude
         # can reach them via its Read tool.
-        current_dir = Path(
-            context.user_data.get("current_directory", self.settings.approved_directory)
-        )
+        # Per-topic state (concurrency-safe): read cwd/session from this topic's slot.
+        _doc_state_key, doc_tstate = self._thread_state_for(update, context)
+        current_dir = Path(doc_tstate.get("current_directory") or self.settings.approved_directory)
 
         # Try enhanced file handler, fall back to basic
         features = context.bot_data.get("features")
@@ -1696,7 +1819,7 @@ class MessageOrchestrator:
                 "Claude integration not available. Check configuration."
             )
             return
-        session_id = context.user_data.get("claude_session_id")
+        session_id = doc_tstate.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1734,13 +1857,12 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
+            # Persist session + cwd into THIS topic's slot (concurrency-safe).
+            new_cwd = self._resolve_cwd_change(claude_response.content, current_dir)
+            doc_tstate["claude_session_id"] = claude_response.session_id
+            doc_tstate["current_directory"] = str(new_cwd)
             context.user_data["claude_session_id"] = claude_response.session_id
-
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
+            context.user_data["current_directory"] = new_cwd
 
             from .utils.formatting import ResponseFormatter
 
@@ -1825,6 +1947,8 @@ class MessageOrchestrator:
         message = update.message
         if message is None:
             return
+        # Capture this topic's routed context before any await (concurrency-safe).
+        self._capture_thread_snapshot(update, context)
 
         features = context.bot_data.get("features")
         image_handler = features.get_image_handler() if features else None
@@ -1945,6 +2069,8 @@ class MessageOrchestrator:
     ) -> None:
         """Transcribe voice message -> Claude, minimal chrome."""
         user_id = update.effective_user.id
+        # Capture this topic's routed context before any await (concurrency-safe).
+        self._capture_thread_snapshot(update, context)
 
         features = context.bot_data.get("features")
         voice_handler = features.get_voice_handler() if features else None
@@ -2006,10 +2132,10 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+        # Per-topic state (concurrency-safe): read cwd/session from this topic's slot.
+        _media_state_key, media_tstate = self._thread_state_for(update, context)
+        current_dir = Path(media_tstate.get("current_directory") or self.settings.approved_directory)
+        session_id = media_tstate.get("claude_session_id")
         force_new = bool(context.user_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
@@ -2047,13 +2173,12 @@ class MessageOrchestrator:
         if force_new:
             context.user_data["force_new_session"] = False
 
+        # Persist session + cwd into THIS topic's slot (concurrency-safe).
+        new_cwd = self._resolve_cwd_change(claude_response.content, current_dir)
+        media_tstate["claude_session_id"] = claude_response.session_id
+        media_tstate["current_directory"] = str(new_cwd)
         context.user_data["claude_session_id"] = claude_response.session_id
-
-        from .handlers.message import _update_working_directory_from_claude_response
-
-        _update_working_directory_from_claude_response(
-            claude_response, context, self.settings, user_id
-        )
+        context.user_data["current_directory"] = new_cwd
 
         from .utils.formatting import ResponseFormatter
 
@@ -2247,27 +2372,32 @@ class MessageOrchestrator:
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle stop: callbacks — interrupt a running Claude request."""
+        """Handle stop: callbacks — interrupt a running Claude request.
+
+        The target run is the one in the TOPIC where the Stop button lives, so a
+        Stop in one topic never interrupts a concurrent run in another."""
         query = update.callback_query
         target_user_id = int(query.data.split(":", 1)[1])
 
         # Only the requesting user can stop their own request
         if query.from_user.id != target_user_id:
-            await query.answer(
-                "Only the requesting user can stop this.", show_alert=True
-            )
+            await query.answer("Only the requesting user can stop this.", show_alert=True)
             return
 
-        # Cancel any pending chunk buffer for this user.
-        for buf_key in self._message_buffer.pending_keys:
-            if buf_key[0] == target_user_id:
-                self._message_buffer.cancel(buf_key)
-        # Cancel any pending media-group buffer for this user.
-        for buf_key in self._media_group_buffer.pending_keys:
-            if buf_key[0] == target_user_id:
-                self._media_group_buffer.cancel(buf_key)
+        # Topic is where the Stop button lives (same keying as _process_agentic_text).
+        chat = update.effective_chat
+        chat_id = getattr(chat, "id", None) if chat is not None else None
+        thread_id = self._extract_message_thread_id(update)
+        topic_key = (chat_id, thread_id)
+        buf_key_topic = (target_user_id, chat_id, thread_id)
 
-        active = self._active_requests.get(target_user_id)
+        # Cancel any pending chunk / media-group buffer for THIS topic only.
+        if buf_key_topic in set(self._message_buffer.pending_keys):
+            self._message_buffer.cancel(buf_key_topic)
+        if buf_key_topic in set(self._media_group_buffer.pending_keys):
+            self._media_group_buffer.cancel(buf_key_topic)
+
+        active = self._active_requests.get(topic_key)
         if not active:
             await query.answer("Already completed.", show_alert=False)
             return

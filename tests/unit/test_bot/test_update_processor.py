@@ -143,8 +143,8 @@ class TestStopCallbackBypassesLock:
 
 
 class TestRegularUpdatesSequential:
-    async def test_two_regular_updates_do_not_overlap(self):
-        """Two regular updates are serialized by the sequential lock."""
+    async def test_two_updates_same_topic_do_not_overlap(self):
+        """Two updates in the SAME topic are serialized by that topic's lock."""
         processor = StopAwareUpdateProcessor()
 
         execution_log: list[str] = []
@@ -159,28 +159,62 @@ class TestRegularUpdatesSequential:
             await asyncio.sleep(0.05)
             execution_log.append("b_end")
 
-        update_a = _make_update(None)
-        update_b = _make_update(None)
+        # Same chat + same thread -> same topic key -> serialized.
+        update_a = _make_text_update("a", chat_id=1, thread_id=7)
+        update_b = _make_text_update("b", chat_id=1, thread_id=7)
 
-        task_a = asyncio.create_task(
-            processor.do_process_update(update_a, coroutine_a())
-        )
+        task_a = asyncio.create_task(processor.do_process_update(update_a, coroutine_a()))
         # Yield so task_a starts and acquires the lock
         await asyncio.sleep(0)
 
-        task_b = asyncio.create_task(
-            processor.do_process_update(update_b, coroutine_b())
-        )
+        task_b = asyncio.create_task(processor.do_process_update(update_b, coroutine_b()))
 
         await asyncio.gather(task_a, task_b)
 
         # b should not start until a has finished
         assert execution_log == ["a_start", "a_end", "b_start", "b_end"]
 
+    async def test_two_updates_different_topics_run_concurrently(self):
+        """Updates in DIFFERENT topics overlap -- the whole point of the fix.
+
+        While topic A is awaiting (mid-run), topic B must be able to start and
+        finish; with a single global lock B would be blocked behind A."""
+        processor = StopAwareUpdateProcessor()
+
+        execution_log: list[str] = []
+        a_holding = asyncio.Event()
+        b_done = asyncio.Event()
+
+        async def coroutine_a():
+            execution_log.append("a_start")
+            a_holding.set()
+            # Hold the topic-A lock until B has fully completed.
+            await b_done.wait()
+            execution_log.append("a_end")
+
+        async def coroutine_b():
+            execution_log.append("b_start")
+            execution_log.append("b_end")
+            b_done.set()
+
+        update_a = _make_text_update("a", chat_id=1, thread_id=7)
+        update_b = _make_text_update("b", chat_id=1, thread_id=9)  # different topic
+
+        task_a = asyncio.create_task(processor.do_process_update(update_a, coroutine_a()))
+        await a_holding.wait()  # A is mid-run, holding topic-A's lock
+
+        task_b = asyncio.create_task(processor.do_process_update(update_b, coroutine_b()))
+
+        await asyncio.gather(task_a, task_b)
+
+        # B ran to completion WHILE A was still in progress.
+        assert execution_log == ["a_start", "b_start", "b_end", "a_end"]
+
 
 class TestNonStopCallbackSequential:
-    async def test_cd_callback_goes_through_sequential_lock(self):
-        """Non-stop callbacks (cd:*) are treated as regular updates."""
+    async def test_cd_callback_goes_through_topic_lock(self):
+        """Non-stop callbacks (cd:*) are treated as regular updates and share the
+        topic lock with text in the same topic."""
         processor = StopAwareUpdateProcessor()
 
         execution_log: list[str] = []
@@ -194,21 +228,21 @@ class TestNonStopCallbackSequential:
             execution_log.append("cd_start")
             execution_log.append("cd_end")
 
-        regular_update = _make_update(None)
+        # Regular text + cd callback in the SAME topic -> serialized.
+        regular_update = _make_text_update("hi", chat_id=1, thread_id=7)
         cd_update = _make_update("cd:my_project")
+        cd_update.callback_query.message = MagicMock()
+        cd_update.callback_query.message.chat.id = 1
+        cd_update.callback_query.message.message_thread_id = 7
 
-        task_regular = asyncio.create_task(
-            processor.do_process_update(regular_update, regular_coroutine())
-        )
+        task_regular = asyncio.create_task(processor.do_process_update(regular_update, regular_coroutine()))
         await asyncio.sleep(0)
 
-        task_cd = asyncio.create_task(
-            processor.do_process_update(cd_update, cd_coroutine())
-        )
+        task_cd = asyncio.create_task(processor.do_process_update(cd_update, cd_coroutine()))
 
         await asyncio.gather(task_regular, task_cd)
 
-        # cd callback waited for regular to finish
+        # cd callback waited for regular to finish (same topic)
         assert execution_log == [
             "regular_start",
             "regular_end",

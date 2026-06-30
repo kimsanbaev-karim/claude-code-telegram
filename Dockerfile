@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG NODE_MAJOR=22
-ARG CLAUDE_CLI_VERSION=1.0.33
+ARG CLAUDE_CLI_VERSION=2.1.195
 ARG POETRY_VERSION=2.1.3
 
 # ---------------------------------------------------------------------------

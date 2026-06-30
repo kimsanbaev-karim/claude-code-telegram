@@ -1,33 +1,40 @@
 """Selective-concurrency update processor for PTB.
 
-Regular updates (messages, commands) process sequentially -- one at a time.
-Priority callbacks (stop:*) bypass the queue and run immediately so they can
-interrupt the currently-running handler.
+Regular updates process sequentially **per topic** -- one at a time within a
+single ``(chat_id, thread_id)``, but *different* topics run concurrently.
+Priority callbacks (``stop:`` / ``ask:``) bypass the queue and run immediately
+so they can interrupt the currently-running handler.
 """
 
 import asyncio
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Dict, Optional, Tuple
 
 from telegram import Update
 from telegram.ext._baseupdateprocessor import BaseUpdateProcessor
 
+# (chat_id, thread_id); either may be None for updates without a clear topic.
+TopicKey = Tuple[Optional[int], Optional[int]]
+
 
 class StopAwareUpdateProcessor(BaseUpdateProcessor):
-    """Update processor that lets priority callbacks bypass sequential processing.
+    """Update processor with per-topic sequential processing.
 
     PTB calls ``process_update(update, coroutine)`` for every incoming update.
     The base class holds a semaphore (max 256) then calls our
     ``do_process_update()``.
 
-    For priority callbacks (``stop:*``): we just ``await coroutine`` -- runs
-    immediately.
-    For everything else: we acquire ``_sequential_lock`` first -- only one
-    runs at a time.
+    For priority callbacks (``stop:`` / ``ask:``) and text answers to a pending
+    question: we just ``await coroutine`` -- runs immediately, no lock.
+    For everything else: we acquire the lock **for that update's topic** -- only
+    one runs at a time *within a topic*, while distinct topics proceed
+    concurrently. This lets the bot answer in several Telegram topics at once
+    while still ordering messages inside a single topic.
 
-    A stop callback arrives while a text handler holds the lock -> stop
-    callback runs concurrently -> fires the ``asyncio.Event`` -> the watcher
-    task inside ``execute_command()`` calls ``client.interrupt()`` -> Claude
-    stops -> ``run_command()`` returns -> handler finishes -> lock released.
+    A stop callback arrives while a text handler holds its topic lock -> stop
+    callback runs concurrently (priority bypass) -> fires the ``asyncio.Event``
+    -> the watcher task inside ``execute_command()`` calls ``client.interrupt()``
+    -> Claude stops -> ``run_command()`` returns -> handler finishes -> lock
+    released.
     """
 
     _PRIORITY_PREFIXES = ("stop:", "ask:")
@@ -35,11 +42,39 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     def __init__(self) -> None:
         # High limit so priority callbacks are never blocked by semaphore
         super().__init__(max_concurrent_updates=256)
-        self._sequential_lock = asyncio.Lock()
+        # One lock per topic. Different topics -> different locks -> concurrent
+        # processing; same topic -> serialized.
+        self._topic_locks: Dict[TopicKey, asyncio.Lock] = {}
+
+    def _get_topic_lock(self, key: TopicKey) -> asyncio.Lock:
+        """Return the lock for *key*, creating one on first use."""
+        lock = self._topic_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._topic_locks[key] = lock
+        return lock
+
+    @staticmethod
+    def _topic_key(update: object) -> TopicKey:
+        """Derive the ``(chat_id, thread_id)`` topic key for an update.
+
+        Falls back to ``(None, None)`` for updates without an associated message
+        so they share a single serial lane (preserving prior behaviour)."""
+        if not isinstance(update, Update):
+            return (None, None)
+        msg = update.message
+        if msg is None and update.callback_query is not None:
+            msg = update.callback_query.message
+        if msg is None:
+            return (None, None)
+        chat = getattr(msg, "chat", None)
+        chat_id = getattr(chat, "id", None) if chat is not None else None
+        thread_id = getattr(msg, "message_thread_id", None)
+        return (chat_id, thread_id)
 
     @classmethod
     def _is_priority(cls, update: object) -> bool:
-        """Priority updates bypass the sequential lock so they can run WHILE a
+        """Priority updates bypass the per-topic lock so they can run WHILE a
         handler holds it: stop/ask button callbacks, and text answers to a pending
         AskUserQuestion (else the answer deadlocks behind the awaiting question run)."""
         if not isinstance(update, Update):
@@ -57,18 +92,15 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
                 return True
         return False
 
-    async def do_process_update(
-        self,
-        update: object,
-        coroutine: Awaitable[Any],
-    ) -> None:
-        """Process an update, applying sequential lock for non-priority updates."""
+    async def do_process_update(self, update: object, coroutine: Awaitable[Any]) -> None:
+        """Process an update, applying the per-topic lock for non-priority updates."""
         if self._is_priority(update):
-            # Run immediately -- no sequential lock
+            # Run immediately -- no lock
             await coroutine
         else:
-            # One at a time for everything else
-            async with self._sequential_lock:
+            # One at a time within a topic; distinct topics run concurrently.
+            lock = self._get_topic_lock(self._topic_key(update))
+            async with lock:
                 await coroutine
 
     async def initialize(self) -> None:

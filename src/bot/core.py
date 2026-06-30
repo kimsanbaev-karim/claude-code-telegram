@@ -266,6 +266,9 @@ class ClaudeCodeBot:
                     drop_pending_updates=True,
                 )
 
+                # Анонс в General-топик, что бот поднялся (мониторинг частоты падений)
+                await self._announce_startup()
+
                 # Keep running until manually stopped
                 _heartbeat_counter = 0
                 while self.is_running:
@@ -279,6 +282,27 @@ class ClaudeCodeBot:
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
         finally:
             self.is_running = False
+
+    async def _announce_startup(self) -> None:
+        """Постит в General-топик форума, что бот поднялся.
+
+        Нужно для мониторинга: по частоте этих сообщений видно, как часто бот
+        перезапускается. Шлётся в General (без message_thread_id — это дефолтный
+        топик форума). Сбой отправки не должен ронять старт бота.
+        """
+        if not self.settings.enable_project_threads or not self.settings.project_threads_chat_id:
+            return
+        import datetime as _dt
+
+        ts = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.settings.project_threads_chat_id,
+                text=f"🟢 Бот поднялся — {ts} (хост: {os.environ.get('HOSTNAME', 'unknown')})",
+            )
+            logger.info("Startup announced to General", chat_id=self.settings.project_threads_chat_id)
+        except Exception as e:
+            logger.warning("Failed to announce startup to General", error=str(e))
 
     async def stop(self) -> None:
         """Gracefully stop the bot."""
