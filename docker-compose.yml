@@ -50,7 +50,7 @@ services:
     container_name: obsidian-sync
     restart: unless-stopped
     command: >
-      sh -c "npm install -g obsidian-headless && ob sync"
+      sh -c "npm install -g obsidian-headless && ob sync --path /vault --continuous"
     volumes:
       - ./vault:/vault
       - obsidian-config:/root/.config/obsidian-headless
